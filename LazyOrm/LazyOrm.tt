@@ -1,0 +1,366 @@
+﻿<#@ template debug="true" hostspecific="false" language="C#" #>
+<#@ assembly name="System.Core" #>
+<#@ assembly name="System.Data" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Data" #>
+<#@ import namespace="System.Data.SqlClient" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ output extension=".cs" #>
+<#
+
+const String connectionString = @"Server=server.in.dai.me;Database=Northwind;Trusted_Connection=True;";
+const String queriesPath      = @"C:\Git\me\LazyOrm\LazyOrm\TestQueries";
+
+SqlConnection con = new SqlConnection( connectionString );
+con.Open();
+
+List<Table> tables = GetAllTables( con );
+List<Query> queries = GetAllQueries( con, new DirectoryInfo( queriesPath ) );
+
+
+#>
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Data;
+using System.Data.SqlClient;
+
+namespace MyNamespace
+{
+	public sealed class MyDatabase : IDisposable
+	{
+		private readonly SqlConnection c;
+
+		private MyDatabase(SqlConnection c)
+		{
+			this.c = c;
+		}
+
+		public void Dispose()
+		{
+			this.c.Dispose();
+		}
+
+		public static async Task<MyDatabase> CreateAsync(String connectionString)
+		{
+			SqlConnection con = new SqlConnection( connectionString );
+			await con.OpenAsync().ConfigureAwait(false);
+			return new MyDatabase( con );
+		}
+
+<#	foreach( Table table in tables.Where( t => !t.IsView ) ) { #>
+		
+		public Task Insert<#= table.CSName #>Async( <#= String.Join( ", ", table.Columns.Where( c => !c.IsIdentity ).Select( c => c.CSType + " " + c.Name ) ) #> )
+		{
+			using( SqlCommand cmd = this.c.CreateCommand() )
+			{
+				cmd.CommandText =
+@"
+INSERT INTO <#= table.Schema #>.<#= table.Name #> (
+	<#= String.Join( ", ", table.Columns.Where( c => !c.IsIdentity ).Select( c => '[' + c.Name + ']' ) ) #>
+) VALUES (
+	<#= String.Join( ", ", table.Columns.Where( c => !c.IsIdentity ).Select( c => '@' + c.Name + ' ' ) ) #>
+)
+";				
+				
+<#		foreach( Column c in table.Columns.Where( c => !c.IsIdentity ) ) { #>
+<#			if( c.IsNullable ) { #>
+				cmd.Parameters.Add( "@<#= c.Name #>", SqlDbType.<#= c.SqlType #> ).Value = ( <#= c.Name #> == null ) ? DBNull.Value : (Object)<#= c.Name #><#= c.IsCSNullable ? ".Value" : "" #>;
+<#			} else { #>
+				cmd.Parameters.Add( "@<#= c.Name #>", SqlDbType.<#= c.SqlType #> ).Value = <#= c.Name #>;
+<#			} #>
+<#		} #>
+
+				return cmd.ExecuteNonQueryAsync();<#/* Avoid the overhead of a tail-await: just return the Task directly */#>
+
+			}
+		}
+
+<#	} #>
+
+<#	foreach( Query query in queries ) { #>
+		public async Task<<#= query.CSResultTypeName #>> Execute<#= query.Name #>QueryAsync()
+		{
+			using( SqlCommand cmd = this.c.CreateCommand() )
+			{
+				cmd.CommandText =
+@"
+<#= query.QueryText #>
+";
+				
+				using( SqlDataReader rdr = await cmd.ExecuteReaderAsync().ConfigureAwait(false) )
+				{
+					<#= query.CSResultTypeName #> allResults = new <#= query.CSResultTypeName #>();
+
+<#		for( Int32 i = 0; i < query.Results.Count; i++ ) { String rowTypeName = query.CSResultTypeName + ".Result" + i + "Row"; #>
+					allResults.Result<#= i #> = new List<<#= rowTypeName #>>();
+
+					while( await rdr.ReadAsync().ConfigureAwait(false) )
+					{
+						<#= rowTypeName #> row = new <#= rowTypeName #>()
+						{
+<#			foreach( Column c in query.Results[i] ) { #>
+<#				if( c.IsNullable ) { #>
+							<#= c.Name #> = rdr.IsDBNull( <#= c.Ordinal #> ) ? (<#= c.CSType #>)null : rdr.Get<#= c.CSType.TrimEnd('?') #>( <#= c.Ordinal #> ),
+<#				} else { #>
+							<#= c.Name #> = rdr.Get<#= c.CSType #>( <#= c.Ordinal #> ),
+<#				} #>
+<#			} #>
+						};
+						allResults.Result<#= i #>.Add( row );
+					}
+
+					await rdr.NextResultAsync().ConfigureAwait(false);
+
+<#		} #>
+					return allResults;
+				}
+			}
+		}
+<#	} #>
+
+	}
+
+<#	foreach( Query query in queries ) { #>
+	public class <#= query.CSResultTypeName #>
+	{
+<#		for( Int32 i = 0; i < query.Results.Count; i++ ) { #>
+			
+		public class Result<#= i #>Row
+		{
+<#			foreach( Column c in query.Results[i] ) { #>
+			public <#= c.CSType #> <#= c.Name #> { get; set; }
+<#			} #>
+		}
+
+		public List<Result<#= i #>Row> Result<#= i#> { get; set; }
+
+<#		} #>
+	}
+<#	} #>
+}
+<#
+
+con.Dispose();
+
+#>
+<#+
+
+List<Table> GetAllTables(SqlConnection con)
+{
+	List<Tuple<Table,Column>> allColumns = new List<Tuple<Table,Column>>();
+
+	using( SqlCommand cmd = con.CreateCommand() )
+	{
+		cmd.CommandText = @"
+SELECT
+	c.TABLE_SCHEMA,
+	c.TABLE_NAME,
+	CASE t.TABLE_TYPE WHEN 'VIEW' THEN 1 ELSE 0 END AS IS_VIEW,
+	c.ORDINAL_POSITION,
+	c.COLUMN_NAME,
+	c.DATA_TYPE,
+	CASE c.IS_NULLABLE WHEN 'YES' THEN 1 ELSE 0 END AS IS_NULLABLE,
+	COLUMNPROPERTY( OBJECT_ID( c.TABLE_SCHEMA + '.' + c.TABLE_NAME ), c.COLUMN_NAME, 'IsIdentity' ) AS IS_IDENTITY
+FROM
+	INFORMATION_SCHEMA.COLUMNS AS c
+	INNER JOIN INFORMATION_SCHEMA.TABLES AS t ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME
+WHERE
+	c.TABLE_NAME <> 'sysdiagrams'
+ORDER BY
+	TABLE_SCHEMA,
+	TABLE_NAME,
+	ORDINAL_POSITION";
+
+		using( SqlDataReader rdr = cmd.ExecuteReader() )
+		{
+			while( rdr.Read() )
+			{
+				Table table = new Table()
+				{
+					Schema = rdr.GetString(0),
+					Name = rdr.GetString(1),
+					IsView = rdr.GetInt32(2) == 1
+				};
+
+				Column col = new Column()
+				{
+					Ordinal = rdr.GetInt32(3),
+					Name = rdr.GetString(4),
+					Type = rdr.GetString(5),
+					IsNullable = rdr.GetInt32(6) == 1,
+					IsIdentity = rdr.GetInt32(7) == 1
+				};
+
+				allColumns.Add( Tuple.Create(table,col) );
+			}
+		}
+	}
+
+	List<Table> allTables = allColumns
+		.GroupBy( tuple => new { tuple.Item1.Schema, tuple.Item1.Name, tuple.Item1.IsView } )
+		.Select( grp =>
+			new Table()
+			{
+				Schema = grp.Key.Schema,
+				Name   = grp.Key.Name,
+				IsView = grp.Key.IsView,
+				Columns = grp.Select( t => t.Item2 ).ToList()
+			} )
+		.ToList();
+
+	return allTables;
+}
+
+List<Query> GetAllQueries(SqlConnection con, DirectoryInfo directory)
+{
+	List<Query> allQueries = directory
+		.GetFiles("*.sql", SearchOption.AllDirectories )
+		.Select( fi => new Query() {
+			Name = Path.GetFileNameWithoutExtension( fi.Name ),
+			QueryText = File.ReadAllText( fi.FullName )
+		} )
+		.Select( q => new Query()
+		{ 
+			Name = q.Name,
+			QueryText = q.QueryText,
+			Results = GetQueryResults( con, q.QueryText )
+		} )
+		.ToList();
+
+	return allQueries;
+}
+
+List<List<Column>> GetQueryResults(SqlConnection con, String queryText)
+{
+	List<List<Column>> allResults = new List<List<Column>>();
+
+	using( SqlCommand cmd = con.CreateCommand() )
+	{
+		cmd.CommandText = queryText;
+
+		using( SqlDataReader rdr = cmd.ExecuteReader() )
+		{
+			do
+			{
+				List<Column> result = new List<Column>();
+
+				DataTable schema = rdr.GetSchemaTable();
+				foreach( DataRow cr in schema.Rows )
+				{
+					result.Add( new Column()
+					{
+						Ordinal = (Int32)cr["ColumnOrdinal"],
+						Name = (String)cr["ColumnName"],
+						Type = (String)cr["DataTypeName"],
+						IsNullable = (Boolean)cr["AllowDBNull"],
+						IsIdentity = (Boolean)cr["IsIdentity"]
+					} );
+				}
+
+				allResults.Add( result );
+			}
+			while( rdr.NextResult() );
+		}
+	}
+
+	return allResults;
+}
+
+class Table
+{
+	public String Schema;
+	public String Name;
+	public Boolean IsView;
+
+	public List<Column> Columns;
+
+	public String CSName => ( this.Schema == "dbo" ? "" : this.Schema ) + ( this.Name.All( c => Char.IsLetterOrDigit(c) ) ? this.Name : String.Concat( this.Name.Where( c => Char.IsLetterOrDigit(c) ) ) );
+}
+
+class Column
+{
+	public Int32 Ordinal;
+	public String Name;
+	public String Type;
+	public Boolean IsNullable;
+	public Boolean IsIdentity;
+
+	public String CSType
+	{
+		get
+		{
+			switch( this.Type )
+			{
+			case "char":
+			case "varchar":
+			case "nchar":
+			case "nvarchar":
+			case "text":
+			case "ntext":
+				return "String";
+
+			case "bit":
+				return "Boolean" + ( this.IsNullable ? "?" : "" );
+			case "tinyint":
+				return "Byte" + ( this.IsNullable ? "?" : "" );
+			case "int":
+				return "Int32" + ( this.IsNullable ? "?" : "" );
+			case "smallint":
+				return "Int16" + ( this.IsNullable ? "?" : "" );
+			case "bigint":
+				return "Int64" + ( this.IsNullable ? "?" : "" );
+			
+			case "date":
+			case "datetime":
+			case "datetime2":
+			case "datetimeoffset":
+			case "smalldate":
+				return "DateTime" + ( this.IsNullable ? "?" : "" );
+			
+			case "float":
+			case "real":
+				return "Double" + ( this.IsNullable ? "?" : "" );
+			
+			case "decimal":
+			case "numeric":
+			case "money":
+			case "smallmoney":
+				return "Decimal" + ( this.IsNullable ? "?" : "" );
+
+			case "uniqueidentifier":
+				return "Guid" + ( this.IsNullable ? "?" : "" );
+
+			case "binary":
+			case "varbinary":
+			case "image":
+				return "Byte[]";
+
+			default:
+				return "TODO" + ( this.IsNullable ? "?" : "" );
+			}
+		}
+	}
+
+	public SqlDbType SqlType => (SqlDbType)Enum.Parse( typeof(SqlDbType), this.Type, true );
+
+	public Boolean IsCSNullable => this.IsNullable && this.CSType != "String" && this.CSType != "Byte[]";
+}
+
+class Query
+{
+	public String Name;
+	public String QueryText;
+
+	//public Boolean IsSingleResultSet => this.Results.Count == 1;
+
+	public String CSResultTypeName => this.Name + "Result";
+
+	public List<List<Column>> Results;
+}
+
+#>
